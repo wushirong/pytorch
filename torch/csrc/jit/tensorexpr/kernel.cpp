@@ -2,6 +2,7 @@
 #include <torch/csrc/jit/tensorexpr/kernel.h>
 
 #include <ATen/ExpandUtils.h>
+#include <ATen/Parallel.h>
 #include <ATen/TensorGeometry.h>
 #include <c10/util/irange.h>
 #include <c10/util/string_utils.h>
@@ -2485,6 +2486,50 @@ void fuseAllLoops(Stmt* st) {
   }
 }
 
+// Flatten and parallelize outermost loops until available threads are
+// saturated.
+template <typename Bufs>
+void parallelizeOuterLoops(LoopNest& l, Bufs&& bufs) {
+  for (auto const& buf : bufs) {
+    auto threads = at::get_num_threads();
+    auto loops = l.getLoopStmtsFor(buf);
+    std::vector<For*> loopsToFlatten;
+    // Figure out total trip count of the loop nest; stop adding nested loops
+    // when we have enough iterations to saturate the available threads.
+    int64_t trips = 1;
+    for (auto loop : loops) {
+      if (trips >= threads) {
+        break;
+      }
+      if (auto stop = dynamic_cast<IntImm*>(loop->stop())) {
+        trips *= immediateAs<int>(stop);
+        loopsToFlatten.push_back(loop);
+        continue;
+      }
+      break;
+    }
+    // There are no loops to parallelize; give up.
+    if (loopsToFlatten.size() < 2) {
+      continue;
+    }
+    // The loop nest contains a reduction; give up.
+    auto reductions = NodeFinder<ReduceOp>::find(loopsToFlatten[0]);
+    if (reductions.size() > 0) {
+      continue;
+    }
+    // The loop nest has loop carried dependences; give up.
+    if (LoopNest::hasLoopCarriedDependence(loopsToFlatten[0])) {
+      continue;
+    }
+    // Try to flatten the outer loops and parallelize them if successful.
+    For* flattened = nullptr;
+    LoopNest::flatten(loopsToFlatten, &flattened);
+    if (flattened) {
+      flattened->set_parallel();
+    }
+  }
+}
+
 Stmt* TensorExprKernel::transformLoops(BackendType backendType, Stmt* st) {
   torch::jit::tensorexpr::LoopNest l(st, bufOutputs_);
   GRAPH_DEBUG("Original Stmt:\n", std::to_string(l.root_stmt()), "\n");
@@ -2526,6 +2571,8 @@ Stmt* TensorExprKernel::transformLoops(BackendType backendType, Stmt* st) {
   if (backendType == kLLVMCodeGen) {
     fuseAllLoops(l.root_stmt());
     GRAPH_DEBUG("after fuse", *l.root_stmt());
+    parallelizeOuterLoops(l, bufOutputs_);
+    GRAPH_DEBUG("after parallelize", *l.root_stmt());
   }
 
   if (backendType == kCudaCodeGen) {
@@ -2600,6 +2647,7 @@ Stmt* TensorExprKernel::transformLoops(BackendType backendType, Stmt* st) {
   }
 
   l.prepareForCodegen();
+  l.simplify();
 
   if (backendType == kLLVMCodeGen && !hasReduction) {
     l.vectorizeInnerLoops();
